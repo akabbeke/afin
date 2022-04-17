@@ -12,7 +12,7 @@ from tqdm.contrib.concurrent import process_map
 from os import listdir
 from os.path import isfile, join
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from . import utils
 
@@ -58,7 +58,11 @@ class ZDataset:
 
     def load_dataframe(self):
         only_files = sorted([f'{self.in_path}/{f}' for f in listdir(self.in_path) if isfile(join(self.in_path, f)) and '.csv' in f])
-        return pd.concat(process_map(utils.load_dataframe, only_files, chunksize=10, desc='Reading Z-Score Files'))
+        print('Merging')
+        start = datetime.now()
+        result = pd.concat(process_map(utils.load_dataframe, only_files, chunksize=10, desc='Reading Z-Score Files'))
+        print(f'Loaded {datetime.now() - start}')
+        return result
 
     def split_dataset(self, split_lower):
         split_upper = timedelta(days=50) + split_lower
@@ -97,7 +101,21 @@ class DatasetSplit:
         return self.dataframe[self.get_feature_columns()]
 
     def dataframe_y(self, look_forward):
-        return self.dataframe[f'future_{look_forward}_day']
+        return self.dataframe[f'future_{look_forward}_day'] - 1
+
+    def sim_y(self, date_dataframe, look_forward):
+        foo = date_dataframe[['Date', 'symbol',]]
+        foo['gain'] = date_dataframe[f'future_{look_forward}_day']
+        return foo
+
+    def sim_data(self, look_forward):
+        data_x = []
+        data_y = []
+        for date in sorted(self.dataframe['Date'].unique()):
+            date_dataframe = self.dataframe[(self.dataframe['Date'] == date)]
+            data_x.append(Variable(torch.from_numpy(date_dataframe[self.get_feature_columns()].to_numpy(dtype=np.float64))).float())
+            data_y.append(self.sim_y(date_dataframe, look_forward))
+        return data_x, data_y
 
     def data_x(self):
         dataframe = self.dataframe_x()
@@ -111,3 +129,15 @@ class DatasetSplit:
             raise Exception()
         data_y = Variable(torch.from_numpy(dataframe.to_numpy(dtype=np.float64))).float()
         return data_y.view((len(data_y), 1))
+
+    def to_folder(self, path):
+        for date in sorted(self.dataframe['Date'].unique()):
+            self.dataframe[(self.dataframe['Date'] == date)].to_csv(f'{path}/{date}.csv')
+
+    @classmethod
+    def from_folder(cls, path):
+        only_files = sorted([f'{path}/{f}' for f in listdir(path) if isfile(join(path, f)) and '.csv' in f])
+        start = datetime.now()
+        result = pd.concat(process_map(utils.load_dataframe, only_files, chunksize=10, desc='Reading Z-Score Files'))
+        print(f'Loaded {datetime.now() - start}')
+        return DatasetSplit(result)

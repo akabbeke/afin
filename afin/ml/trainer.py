@@ -8,20 +8,19 @@ class Trainer:
         self.model = model
         self.learning_rate = learning_rate
 
-    @cached_property
-    def criterion(self):
-        return torch.nn.MSELoss()
-
-    @cached_property
-    def optimizer(self):
-        return torch.optim.SGD(
+        self.criterion = torch.nn.MSELoss()
+        self.optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=self.learning_rate,
         )
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizer,
+            gamma=0.994
+        )
 
     def train(self, train_x, train_y, epochs = 1000):
-        print(list(self.model.parameters()))
-        for epoch in tqdm(range(epochs), desc='Training Model Epochs'):
+        pbar = tqdm(range(epochs), desc='Training Model Epochs')
+        for epoch in pbar:
             # Clear gradient buffers because we don't want any gradient from previous epoch to carry forward, dont want to cummulate gradients
             self.optimizer.zero_grad()
 
@@ -35,6 +34,9 @@ class Trainer:
 
             # update parameters
             self.optimizer.step()
+            self.scheduler.step()
+
+            pbar.set_description(f"Training Model Epochs {round(loss.item(), 6)}")
 
             
         print('epoch {}, loss {}'.format(epoch, loss.item()))
@@ -44,32 +46,132 @@ class Trainer:
         cost = self.criterion(output, test_y)
         print("mean squared error:", cost.item())
 
-    def test_simulated(model, look_forward, start_value, dataframe):
-        date_slices = load_test_dataset('2021-06-01', '2021-08-01', dataframe, look_forward)
-        total_value = start_value
-        split_count = 10
-        out_data  = []
-        for test_x, test_y, date in date_slices:
-            
-            new_value = 0
-            output = model(test_x)
-            sourted_output = sorted(enumerate(output), key=lambda x: x[1], reverse=True)
-            for i, increase in sourted_output[:split_count]:
-                row_data = test_y.iloc[i]
-                increase = row_data[f'future_{look_forward}_day']
-                # print(f'  {row_data["Date"]} - {row_data["symbol"]} - increase {increase} - buy {total_value/5} - sell {increase * total_value/5} - earn {(increase * total_value/5) - total_value/5}')
-                new_value += increase * total_value/split_count
-            print(date, new_value/total_value)
-            total_value = new_value
-            out_data.append([date, total_value])
-        return out_data
-
+    def test_simulated(self, data_x, data_y, split_count, initial_value, look_forward):
+        simulator = Simulator(self.model, data_x, data_y, split_count, look_forward, initial_value)
+        return simulator.simulate()
 
     def to_file(self, path):
         torch.save(self.model.state_dict(), path)
 
     @classmethod
-    def from_file(cls, model, path):
+    def from_file(cls, model, path,):
         model.load_state_dict(torch.load(path))
         model.eval()
-        return Trainer(model)
+        return Trainer(model, 0)
+
+
+class AccountSplit:
+    def __init__(self, ) -> None:
+        pass
+
+
+class TradeData:
+    def __init__(self, value, date, symbols) -> None:
+        self.value = value
+        self.date = date
+        self.symbols = symbols
+
+
+class SimulatorAccount:
+    def __init__(self, initial) -> None:
+        self.stored = initial
+        self.shared = 0
+
+    def add_shared(self, value):
+        self.shared += value
+
+    def set_shared(self, value):
+        self.shared = value
+
+    def set_stored(self, value):
+        self.stored = value
+
+
+class SimulatorAccounts:
+    def __init__(self, initial, forward) -> None:
+        self.forward = forward
+        self.data = {x: SimulatorAccount(initial/forward) for x in range(forward)}
+
+    def sell(self, day):
+        for k in self.data:
+            self.data[k].add_shared(self.data[day].stored/self.forward)
+        self.data[day].set_stored(0)
+
+    def shared(self, day):
+        return self.data[day].shared
+
+    def set_store(self, day, value):
+        self.data[day].set_shared(0)
+        return self.data[day].set_stored(value)
+
+    def total_shared(self):
+        total = 0
+        for k in self.data:
+            total += self.data[k].shared
+        return total
+
+    def total_value(self):
+        total = 0
+        for k in self.data:
+            total += self.data[k].shared
+            total += self.data[k].stored
+        return total
+
+
+class Simulator:
+    def __init__(self, model, data_x, data_y, split, forward, initial) -> None:
+        self.model = model
+        self.data_x = data_x
+        self.data_y = data_y
+        self.split = split
+        self.forward = forward
+        self.accounts = SimulatorAccounts(initial, forward)
+        self.history = []
+
+    def simulate(self):
+        for index in range(len(self.data_x)):
+            self.simulate_day(index)
+        return self.history
+
+    def day_index(self, day):
+        return day % self.forward
+
+    def predict_day(self, day):
+        return self.model(self.data_x[day])
+
+    def top_pick_indices(self, day):
+        return sorted(
+            enumerate(self.predict_day(day)),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:self.split]
+
+    def top_picks(self, day):
+        picks = []
+        for i, _ in self.top_pick_indices(day):
+            picks.append(self.data_y[day].iloc[i])
+        return picks
+
+    def simulate_day(self, day):
+        self.accounts.sell(self.day_index(day))
+
+        new_value = 0
+        symbols = []
+
+        for pick in self.top_picks(day):
+            if pick['gain'] < 3:
+                new_value += pick['gain'] * self.accounts.shared(self.day_index(day))/self.split
+            else:
+                new_value += self.accounts.shared(self.day_index(day))/self.split
+            symbols.append(pick["symbol"])
+            date = pick["Date"]
+
+        self.accounts.set_store(self.day_index(day), new_value)
+
+        self.history.append(
+            TradeData(
+                value=self.accounts.total_value(),
+                date=date,
+                symbols=symbols
+            )
+        )
